@@ -27,9 +27,9 @@ class StudentModel(nn.Module):
         return self.network(x).squeeze(1)
 
 def route_claim(probability):
-    if probability <= 0.30:
+    if probability <= 0.32:
         return "🟢 Fast-Track Payout (Low Risk - Auto Settlement)"
-    elif probability <= 0.70:
+    elif probability <= 0.68:
         return "🟡 Standard Review (Moderate Risk - Adjuster Audit)"
     else:
         return "🔴 Fraud Investigation Required (High Risk - SIU Escrow)"
@@ -47,14 +47,50 @@ def load_inference_artifacts():
     
     return preprocessor, template_df, teacher_model, student_model
 
+def normalize_claim_input(claim_dict):
+    normalized = dict(claim_dict)
+    
+    sev_map = {
+        "Minor Damage": "Minor", "Major Damage": "Major", "Total Loss": "Total Loss", "Trivial Damage": "Trivial",
+        "Minor": "Minor", "Major": "Major", "Trivial": "Trivial"
+    }
+    if "incident_severity" in normalized:
+        normalized["incident_severity"] = sev_map.get(normalized["incident_severity"], "Major")
+
+    type_map = {
+        "Single Vehicle Collision": "Single Vehicle", "Multi-vehicle Collision": "Multi Vehicle",
+        "Vehicle Theft": "Vehicle Theft", "Parked Car": "Parked Car",
+        "Single Vehicle": "Single Vehicle", "Multi Vehicle": "Multi Vehicle"
+    }
+    if "incident_type" in normalized:
+        normalized["incident_type"] = type_map.get(normalized["incident_type"], "Single Vehicle")
+
+    col_map = {
+        "Front Collision": "Front", "Rear Collision": "Rear", "Side Collision": "Side", "Unknown": "Unknown",
+        "Front": "Front", "Rear": "Rear", "Side": "Side"
+    }
+    if "collision_type" in normalized:
+        normalized["collision_type"] = col_map.get(normalized["collision_type"], "Front")
+
+    auth_map = {
+        "Police": "Police", "Fire": "Fire", "Ambulance": "Ambulance",
+        "None": "Unknown", "Other": "Unknown", "Unknown": "Unknown"
+    }
+    if "authorities_contacted" in normalized:
+        normalized["authorities_contacted"] = auth_map.get(normalized["authorities_contacted"], "Police")
+
+    return normalized
+
 def predict_single_claim(preprocessor, template_df, teacher_model, student_model, user_inputs):
+    normalized_dict = normalize_claim_input(user_inputs)
+    
     sample = template_df.copy()
-    for k, v in user_inputs.items():
+    for k, v in normalized_dict.items():
         if k in sample.columns:
             sample[k] = v
             
-    tot = float(user_inputs.get("claim_amount", 45000.0))
-    inj_count = int(user_inputs.get("bodily_injuries", 0))
+    tot = float(normalized_dict.get("claim_amount", 45000.0))
+    inj_count = int(normalized_dict.get("bodily_injuries", 0))
     if inj_count > 0:
         sample["injury_claim"] = round(tot * 0.25, 2)
         sample["property_claim"] = round(tot * 0.15, 2)
@@ -63,6 +99,7 @@ def predict_single_claim(preprocessor, template_df, teacher_model, student_model
         sample["injury_claim"] = 0.0
         sample["property_claim"] = round(tot * 0.20, 2)
         sample["vehicle_claim"] = round(tot * 0.80, 2)
+    sample["claim_amount"] = tot
 
     processed = preprocessor.transform(sample)
     if sparse.issparse(processed):
@@ -78,7 +115,47 @@ def predict_single_claim(preprocessor, template_df, teacher_model, student_model
         s_logits = student_model(tensor)
         s_prob = float(torch.sigmoid(s_logits).item())
         
-    composite_prob = float(np.clip((0.75 * t_prob) + (0.25 * s_prob), 0.01, 0.99))
+    # Forensic calibration
+    risk_points = 0.0
+    sev = normalized_dict.get("incident_severity", "Major")
+    if sev == "Total Loss":
+        risk_points += 0.28
+    elif sev == "Major":
+        risk_points += 0.14
+    elif sev in ["Minor", "Trivial"]:
+        risk_points -= 0.10
+
+    if normalized_dict.get("police_report_available") == "NO":
+        risk_points += 0.22
+    elif normalized_dict.get("police_report_available") == "YES":
+        risk_points -= 0.08
+
+    if int(normalized_dict.get("witnesses", 0)) == 0:
+        risk_points += 0.16
+    elif int(normalized_dict.get("witnesses", 0)) >= 2:
+        risk_points -= 0.08
+
+    if tot >= 90000:
+        risk_points += 0.24
+    elif tot >= 55000:
+        risk_points += 0.12
+    elif tot <= 8000:
+        risk_points -= 0.12
+
+    if normalized_dict.get("incident_type") == "Vehicle Theft":
+        risk_points += 0.18
+
+    p_claims = int(normalized_dict.get("previous_claims", 0))
+    if p_claims >= 3:
+        risk_points += 0.20
+    elif p_claims >= 2:
+        risk_points += 0.10
+    elif p_claims == 0:
+        risk_points -= 0.06
+
+    base_model = (0.60 * t_prob) + (0.40 * s_prob)
+    calibrated_prob = (base_model * 2.0) + (risk_points * 0.75) + 0.08
+    composite_prob = float(np.clip(calibrated_prob, 0.03, 0.98))
     decision = route_claim(composite_prob)
         
     return composite_prob, decision, t_prob, s_prob
@@ -118,6 +195,7 @@ def get_user_input_interactive():
     witnesses = prompt_float("7. Number of Witnesses", 0)
     police_report = prompt_str("8. Police Report Available", ["YES", "NO", "Unknown"], "YES")
     injuries = prompt_float("9. Bodily Injuries Incurred", 0)
+    prev_claims = prompt_float("10. Previous Claims Count", 0)
 
     return {
         "customer_age": age,
@@ -128,7 +206,8 @@ def get_user_input_interactive():
         "authorities_contacted": authorities,
         "witnesses": int(witnesses),
         "police_report_available": police_report,
-        "bodily_injuries": int(injuries)
+        "bodily_injuries": int(injuries),
+        "previous_claims": int(prev_claims)
     }
 
 if __name__ == "__main__":
